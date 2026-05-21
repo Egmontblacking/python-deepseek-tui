@@ -1,0 +1,8 @@
+# DeepSeek TUI - Python 实现
+# 终端对话智能体，支持流式推理、工具调用、会话持久化
+
+httpx>=0.28.0
+rich>=13.0.0
+pydantic>=2.0.0
+sseclient-py>=1.8.0
+python-dotenv>=1.0.0
