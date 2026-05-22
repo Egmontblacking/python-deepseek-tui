@@ -121,6 +121,8 @@ class DeepSeekClient:
                 m["tool_call_id"] = msg["tool_call_id"]
             if "name" in msg:
                 m["name"] = msg["name"]
+            if "reasoning_content" in msg:
+                m["reasoning_content"] = msg["reasoning_content"]
             cleaned.append(m)
         return cleaned
 
@@ -165,15 +167,14 @@ class DeepSeekClient:
             try:
                 await self.bucket.acquire()
                 async for event in self._do_stream(body):
+                    self.health.mark_success()
                     yield event
-                return  # 成功
+                return
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code
-                # 流式响应不能直接访问 .text（body 未 read）
-                # 用状态码映射给出友好提示
                 ERROR_HINTS = {
                     401: "Invalid or missing API key",
-                    403: "Access denied — check API key permissions",
+                    403: "Access denied",
                     429: "Rate limited — retrying...",
                     500: "Server error",
                     502: "Bad gateway",
@@ -181,21 +182,19 @@ class DeepSeekClient:
                 }
                 hint = ERROR_HINTS.get(status_code, "")
                 error_msg = f"HTTP {status_code}" + (f": {hint}" if hint else "")
-
-                if status_code in (429, 500, 502, 503):
-                    if attempt < self.max_retries:
-                        delay = 2 ** attempt + (0.1 * attempt)
-                        logger.warning("Retry %d/%d after %.1fs", attempt + 1, self.max_retries, delay)
-                        await asyncio.sleep(delay)
-                        self.health.mark_failure()
-                        continue
+                if status_code in (429, 500, 502, 503) and attempt < self.max_retries:
+                    delay = 2 ** attempt + (0.1 * attempt)
+                    logger.warning("Retry %d/%d after %.1fs", attempt + 1, self.max_retries, delay)
+                    await asyncio.sleep(delay)
+                    self.health.mark_failure()
+                    continue
                 logger.error("%s", error_msg)
                 yield {"type": "error", "message": error_msg}
                 return
             except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                 if attempt < self.max_retries:
                     delay = 2 ** attempt
-                    logger.warning("Network error, retry %d/%d after %.1fs", attempt + 1, self.max_retries, delay)
+                    logger.warning("Network error, retry %d/%d", attempt + 1, self.max_retries)
                     await asyncio.sleep(delay)
                     self.health.mark_failure()
                     continue
@@ -203,14 +202,12 @@ class DeepSeekClient:
                 return
 
     async def _do_stream(self, body: dict) -> AsyncIterator[dict]:
-        """发送 POST 请求并逐行解析 SSE"""
         url = f"{self.base_url}/v1/chat/completions"
         async with self._http.stream("POST", url, json=body) as response:
             response.raise_for_status()
-
-            current_block_type = None   # "thinking" | "text" | "tool_call"
+            current_block_type = None
             current_index = -1
-            tool_calls_state: dict[int, dict] = {}  # index -> {id, name, input_parts}
+            tool_calls_state: dict[int, dict] = {}
             usage = {}
 
             async for line in response.aiter_lines():
@@ -218,7 +215,6 @@ class DeepSeekClient:
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
-                    # 发送块结束事件
                     if current_block_type == "thinking":
                         yield {"type": "thinking_stop", "index": current_index}
                     elif current_block_type == "text":
@@ -227,51 +223,39 @@ class DeepSeekClient:
                         for idx in sorted(tool_calls_state.keys()):
                             state = tool_calls_state[idx]
                             raw = "".join(state["input_parts"])
-                            if raw.strip():
-                                try:
-                                    tool_input = json.loads(raw)
-                                except json.JSONDecodeError:
-                                    tool_input = {"_raw_args": raw}
-                            else:
-                                tool_input = {}
-                            yield {
-                                "type": "tool_call_stop",
-                                "index": idx,
-                                "id": state["id"],
-                                "name": state["name"],
-                                "input": tool_input,
-                            }
+                            tool_input = json.loads(raw) if raw.strip() else {}
+                            yield {"type": "tool_call_stop", "index": idx, "id": state["id"], "name": state["name"], "input": tool_input}
                     yield {"type": "finish", "usage": usage}
                     return
-
                 try:
                     obj = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-
                 choices = obj.get("choices", [])
                 if not choices:
                     continue
-
                 usage = obj.get("usage", usage)
                 delta = choices[0].get("delta", {})
 
-                # ── 处理 reasoning_content (thinking) ──
                 reasoning = delta.get("reasoning_content", "")
                 if reasoning:
                     if current_block_type == "thinking":
                         yield {"type": "thinking_delta", "index": current_index, "content": reasoning}
                     else:
-                        # 切换块
                         if current_block_type == "text":
                             yield {"type": "text_stop", "index": current_index}
+                        elif current_block_type == "tool_call":
+                            for idx in sorted(tool_calls_state.keys()):
+                                s = tool_calls_state[idx]
+                                raw = "".join(s["input_parts"])
+                                yield {"type": "tool_call_stop", "index": idx, "id": s["id"], "name": s["name"], "input": json.loads(raw) if raw.strip() else {}}
+                            tool_calls_state.clear()
                         current_block_type = "thinking"
                         current_index += 1
                         yield {"type": "thinking_start", "index": current_index}
                         yield {"type": "thinking_delta", "index": current_index, "content": reasoning}
                     continue
 
-                # ── 处理 tool_calls ──
                 tool_calls = delta.get("tool_calls", [])
                 if tool_calls:
                     if current_block_type != "tool_call":
@@ -280,53 +264,35 @@ class DeepSeekClient:
                         elif current_block_type == "text":
                             yield {"type": "text_stop", "index": current_index}
                         current_block_type = "tool_call"
-
                     for tc in tool_calls:
                         idx = tc.get("index", 0)
                         if idx not in tool_calls_state:
-                            tool_calls_state[idx] = {
-                                "id": tc.get("id", ""),
-                                "name": tc.get("function", {}).get("name", ""),
-                                "input_parts": [],
-                            }
-                            yield {
-                                "type": "tool_call_start",
-                                "index": idx,
-                                "id": tool_calls_state[idx]["id"],
-                                "name": tool_calls_state[idx]["name"],
-                            }
+                            tool_calls_state[idx] = {"id": tc.get("id", ""), "name": tc.get("function", {}).get("name", ""), "input_parts": []}
+                            yield {"type": "tool_call_start", "index": idx, "id": tool_calls_state[idx]["id"], "name": tool_calls_state[idx]["name"]}
                         func = tc.get("function", {})
                         if "arguments" in func:
                             tool_calls_state[idx]["input_parts"].append(func["arguments"])
                     continue
 
-                # ── 处理 content ──
                 content = delta.get("content", "")
                 if content:
                     if current_block_type != "text":
                         if current_block_type == "thinking":
                             yield {"type": "thinking_stop", "index": current_index}
+                        elif current_block_type == "tool_call":
+                            for idx in sorted(tool_calls_state.keys()):
+                                s = tool_calls_state[idx]
+                                raw = "".join(s["input_parts"])
+                                yield {"type": "tool_call_stop", "index": idx, "id": s["id"], "name": s["name"], "input": json.loads(raw) if raw.strip() else {}}
+                            tool_calls_state.clear()
                         current_block_type = "text"
                         current_index += 1
                         yield {"type": "text_start", "index": current_index}
                     yield {"type": "text_delta", "index": current_index, "content": content}
 
-        # 流结束但没收到 [DONE]
         if current_block_type == "tool_call":
             for idx in sorted(tool_calls_state.keys()):
-                state = tool_calls_state[idx]
-                raw = "".join(state["input_parts"])
-                tool_input = {}
-                if raw.strip():
-                    try:
-                        tool_input = json.loads(raw)
-                    except json.JSONDecodeError:
-                        tool_input = {"_raw_args": raw}
-                yield {
-                    "type": "tool_call_stop",
-                    "index": idx,
-                    "id": state["id"],
-                    "name": state["name"],
-                    "input": tool_input,
-                }
+                s = tool_calls_state[idx]
+                raw = "".join(s["input_parts"])
+                yield {"type": "tool_call_stop", "index": idx, "id": s["id"], "name": s["name"], "input": json.loads(raw) if raw.strip() else {}}
         yield {"type": "finish", "usage": usage}

@@ -1,0 +1,37 @@
+[project]
+name = "deepseek-tui"
+version = "0.2.0"
+description = "DeepSeek TUI — 企业级终端 AI 编程智能体"
+authors = [{ name = "DeepSeek TUI Contributors" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "httpx>=0.28.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "aiosqlite>=0.20.0",
+    "tiktoken>=0.7.0",
+    "textual>=1.0.0",
+    "pygments>=2.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "textual-dev>=1.0.0",
+]
+
+[project.scripts]
+deepseek-tui = "deepseek_tui.main:main"
+
+[build-system]
+requires = ["setuptools>=75.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

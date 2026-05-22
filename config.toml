@@ -1,0 +1,35 @@
+# DeepSeek TUI 默认配置
+# 复制为 config.toml 并修改，或通过环境变量覆盖
+
+[api]
+# DeepSeek API 配置
+# 优先使用环境变量 DEEPSEEK_API_KEY
+key = ""
+base_url = "https://api.deepseek.com"
+model = "deepseek-chat"
+
+[limits]
+# 工具执行限制
+max_tool_steps = 10
+shell_timeout_secs = 60
+grep_max_files = 100
+grep_max_results = 50
+
+[ui]
+# 终端界面
+theme = "dark"              # dark | light
+max_history_display = 100   # 侧边栏最多显示消息数
+
+[session]
+# 会话持久化
+# 存储位置: ~/.deepseek-tui/
+auto_save = true
+
+[subagents]
+# 子智能体控制
+max_concurrent = 10         # 最大并发数
+
+[context]
+# 上下文管理
+max_tokens = 1000000        # 模型窗口（DeepSeek V4: 1M）
+compact_threshold = 0.8     # 80% 用量时触发压缩

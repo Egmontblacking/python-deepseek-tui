@@ -2,3 +2,5 @@ __pycache__/
 .env
 test_sessions/
 *.pyc
+*.db
+checkpoints/
